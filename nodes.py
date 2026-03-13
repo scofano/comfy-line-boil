@@ -3,8 +3,8 @@ import numpy as np
 import cv2
 import os
 import logging
-from concurrent.futures import ProcessPoolExecutor
-from .core import process_single_frame_task, worker_init, is_cuda_available, set_cv2_threads
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from .core import process_single_frame_task, is_cuda_available, set_cv2_threads, can_use_multiprocessing, is_windows, worker_init
 import comfy.utils
 
 logger = logging.getLogger("ComfyUI-LineBoil")
@@ -46,43 +46,62 @@ class LineBoilImage:
         workers = params['workers']
         use_gpu = params['use_gpu'] and is_cuda_available()
 
-        # --- Multiprocessing Strategy ---
-        # 1. Disable MP if use_gpu is True (CUDA context issues in child processes)
-        # 2. Disable MP if batch_size is small (overhead not worth it)
-        # 3. Force workers=1 if workers param is 1
+        # --- Concurrency Strategy ---
+        # 1. On Windows, we avoid ProcessPoolExecutor entirely due to the 'spawn' re-import issue.
+        #    ThreadPoolExecutor is used instead because OpenCV releases the GIL for heavy ops.
+        # 2. On other platforms (Linux/macOS), ProcessPoolExecutor is used if GPU is disabled.
+        # 3. If GPU is enabled, we stay in-process (ThreadPool) to avoid CUDA context sharing issues.
+        
         effective_workers = workers
-        if use_gpu or batch_size < 4 or workers <= 1:
+        if batch_size < 2 or workers <= 1:
             effective_workers = 1
 
         frames_np = (images.cpu().numpy() * 255).astype(np.uint8)
         processed_frames = [None] * batch_size
         
+        set_cv2_threads(1)
+
         if effective_workers > 1:
-            # Multiprocessing Path
-            with ProcessPoolExecutor(max_workers=effective_workers, initializer=worker_init) as executor:
-                futures = []
-                for i in range(batch_size):
-                    frame = frames_np[i]
-                    if frame.shape[2] == 3: # Ensure RGBA
-                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2RGBA)
+            use_processes = can_use_multiprocessing() and not use_gpu
+            ExecutorClass = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
+            
+            try:
+                init_args = {"initializer": worker_init} if use_processes else {}
+                with ExecutorClass(max_workers=effective_workers, **init_args) as executor:
+                    futures = []
+                    for i in range(batch_size):
+                        frame = frames_np[i]
+                        if frame.shape[2] == 3:
+                            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2RGBA)
+                        
+                        frame_seed = int(seed + (i // hold))
+                        # Pass simple types only to ensure picklability
+                        futures.append(executor.submit(process_single_frame_task, frame, frame_seed, core_params, use_gpu if not use_processes else False))
                     
-                    frame_seed = seed + (i // hold)
-                    futures.append(executor.submit(process_single_frame_task, frame, frame_seed, core_params, False)) # Force CPU in MP
-                
-                for i, future in enumerate(futures):
-                    res = future.result()
-                    res_rgb = cv2.cvtColor(res, cv2.COLOR_RGBA2RGB)
-                    processed_frames[i] = res_rgb.astype(np.float32) / 255.0
-                    pbar.update(1)
+                    for i, future in enumerate(futures):
+                        res = future.result()
+                        res_rgb = cv2.cvtColor(res, cv2.COLOR_RGBA2RGB)
+                        processed_frames[i] = res_rgb.astype(np.float32) / 255.0
+                        pbar.update(1)
+            except Exception as e:
+                logger.error(f"Concurrency failed ({type(e).__name__}): {e}. Falling back to sequential.")
+                # Fallback: Process missing frames sequentially
+                for i in range(batch_size):
+                    if processed_frames[i] is None:
+                        frame = frames_np[i]
+                        if frame.shape[2] == 3: frame = cv2.cvtColor(frame, cv2.COLOR_RGB2RGBA)
+                        res = process_single_frame_task(frame, int(seed + (i // hold)), core_params, use_gpu)
+                        res_rgb = cv2.cvtColor(res, cv2.COLOR_RGBA2RGB)
+                        processed_frames[i] = res_rgb.astype(np.float32) / 255.0
+                        pbar.update(1)
         else:
-            # Single-threaded / GPU Path
-            set_cv2_threads(1) # Minimize oversubscription
+            # Sequential Path
             for i in range(batch_size):
                 frame = frames_np[i]
                 if frame.shape[2] == 3:
                     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2RGBA)
                 
-                frame_seed = seed + (i // hold)
+                frame_seed = int(seed + (i // hold))
                 res = process_single_frame_task(frame, frame_seed, core_params, use_gpu)
                 res_rgb = cv2.cvtColor(res, cv2.COLOR_RGBA2RGB)
                 processed_frames[i] = res_rgb.astype(np.float32) / 255.0
@@ -135,12 +154,9 @@ class LineBoilVideo:
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        # Safer codec strategy: Prefer MP4V or H264 if available
-        # Avoid blindly reusing input fourcc which might be incompatible for writing
         fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
-
         base, ext = os.path.splitext(video_path)
-        out_path = f"{base}{suffix}.mp4" # Force .mp4 for mp4v codec consistency
+        out_path = f"{base}{suffix}.mp4"
         
         writer = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
         if not writer.isOpened():
@@ -156,43 +172,62 @@ class LineBoilVideo:
         workers = params['workers']
         use_gpu = params['use_gpu'] and is_cuda_available()
 
-        # Video always processes in chunks for memory safety
-        effective_workers = 1 if use_gpu else workers
-        chunk_size = max(effective_workers * 2, 8)
+        effective_workers = workers
+        chunk_size = max(effective_workers * 4, 16)
+        set_cv2_threads(1)
         
         try:
             if effective_workers > 1:
-                with ProcessPoolExecutor(max_workers=effective_workers, initializer=worker_init) as executor:
-                    frame_idx = 0
+                use_processes = can_use_multiprocessing() and not use_gpu
+                ExecutorClass = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
+                init_args = {"initializer": worker_init} if use_processes else {}
+                
+                frame_idx = 0
+                pool_failed = False
+                
+                with ExecutorClass(max_workers=effective_workers, **init_args) as executor:
                     while True:
                         frames_chunk = []
                         seeds_chunk = []
                         for _ in range(chunk_size):
                             ret, frame = cap.read()
                             if not ret: break
-                            frame_rgba = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
-                            frames_chunk.append(frame_rgba)
-                            seeds_chunk.append(seed + (frame_idx // hold))
+                            frames_chunk.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA))
+                            seeds_chunk.append(int(seed + (frame_idx // hold)))
                             frame_idx += 1
                         
                         if not frames_chunk: break
                         
-                        futures = [executor.submit(process_single_frame_task, f, s, core_params, False) for f, s in zip(frames_chunk, seeds_chunk)]
-                        for future in futures:
-                            res = future.result()
-                            res_bgr = cv2.cvtColor(res, cv2.COLOR_RGBA2BGR)
-                            writer.write(res_bgr)
-                            pbar.update(1)
+                        if not pool_failed:
+                            try:
+                                futures = [executor.submit(process_single_frame_task, f, s, core_params, use_gpu if not use_processes else False) for f, s in zip(frames_chunk, seeds_chunk)]
+                                for future in futures:
+                                    res = future.result()
+                                    writer.write(cv2.cvtColor(res, cv2.COLOR_RGBA2BGR))
+                                    pbar.update(1)
+                            except Exception as e:
+                                logger.error(f"Video pool failed ({type(e).__name__}): {e}. Switching to sequential.")
+                                pool_failed = True
+                                # Process missed chunk sequentially
+                                for f, s in zip(frames_chunk, seeds_chunk):
+                                    res = process_single_frame_task(f, s, core_params, use_gpu)
+                                    writer.write(cv2.cvtColor(res, cv2.COLOR_RGBA2BGR))
+                                    pbar.update(1)
+                        else:
+                            # Pool already failed, process chunk sequentially
+                            for f, s in zip(frames_chunk, seeds_chunk):
+                                res = process_single_frame_task(f, s, core_params, use_gpu)
+                                writer.write(cv2.cvtColor(res, cv2.COLOR_RGBA2BGR))
+                                pbar.update(1)
             else:
-                set_cv2_threads(1)
+                # Standard sequential path
                 frame_idx = 0
                 while True:
                     ret, frame = cap.read()
                     if not ret: break
                     frame_rgba = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
-                    res = process_single_frame_task(frame_rgba, seed + (frame_idx // hold), core_params, use_gpu)
-                    res_bgr = cv2.cvtColor(res, cv2.COLOR_RGBA2BGR)
-                    writer.write(res_bgr)
+                    res = process_single_frame_task(frame_rgba, int(seed + (frame_idx // hold)), core_params, use_gpu)
+                    writer.write(cv2.cvtColor(res, cv2.COLOR_RGBA2BGR))
                     pbar.update(1)
                     frame_idx += 1
         finally:
